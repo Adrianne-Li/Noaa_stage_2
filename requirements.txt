@@ -1,0 +1,8 @@
+pandas>=2.0
+geopandas>=0.14
+requests>=2.31
+beautifulsoup4>=4.12
+shapely>=2.0
+pyogrio>=0.7
+boto3>=1.34
+osfclient>=0.0.5
