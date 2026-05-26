@@ -1,0 +1,179 @@
+name: Monthly NOAA Storm Events scrape
+
+# Runs at 06:00 UTC on the 2nd of every month.
+on:
+  schedule:
+    - cron: '0 6 2 * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scrape mode'
+        type: choice
+        required: true
+        default: 'incremental'
+        options:
+          - incremental
+          - current-year-only
+          - full-rebuild
+      start_year:
+        description: 'Start year (full-rebuild only)'
+        required: false
+        default: '1984'
+      end_year:
+        description: 'End year (full-rebuild only, blank = current year)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      OUTPUT_DIR: ./outputs
+      DATA_DIR: ./data
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      S3_PREFIX: noaa-storm-events/
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      OSF_TOKEN: ${{ secrets.OSF_TOKEN }}
+      OSF_PROJECT: ${{ secrets.OSF_PROJECT }}
+      MODE: ${{ github.event.inputs.mode || 'incremental' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdal-bin libgdal-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache shapefiles
+        # Caches the ~1.5 GB extracted Newberry + TIGER files so we don't
+        # re-download on every run. Cache key bumps when setup_data.py changes.
+        uses: actions/cache@v4
+        with:
+          path: ./data
+          key: shapefiles-v1-${{ hashFiles('scripts/setup_data.py') }}
+          restore-keys: |
+            shapefiles-v1-
+
+      - name: Set up shapefiles (downloads if not cached)
+        run: python scripts/setup_data.py --data-dir "$DATA_DIR"
+
+      - name: Verify S3 credentials
+        run: |
+          if [ -z "$S3_BUCKET" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::S3_BUCKET / AWS_ACCESS_KEY_ID secrets are not set."
+            exit 1
+          fi
+          aws s3 ls "s3://$S3_BUCKET/" --summarize >/dev/null
+          echo "S3 access OK."
+
+      - name: Pull existing raw CSV from S3 (incremental only)
+        if: env.MODE == 'incremental'
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          existing_key=$(python scripts/01_upload_to_s3.py \
+            --bucket "$S3_BUCKET" --prefix "$S3_PREFIX" \
+            --print-existing-raw-key)
+          if [ -n "$existing_key" ]; then
+            echo "Found existing raw CSV at: $existing_key"
+            local_path="$OUTPUT_DIR/$(basename $existing_key)"
+            aws s3 cp "s3://$S3_BUCKET/$existing_key" "$local_path"
+            echo "EXISTING_RAW=$local_path" >> "$GITHUB_ENV"
+          else
+            echo "No existing raw CSV in S3; falling back to current-year-only."
+            echo "MODE=current-year-only" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run scraper (incremental)
+        if: env.MODE == 'incremental'
+        run: |
+          python scripts/00_scrape_noaa.py \
+            --incremental \
+            --existing-raw "$EXISTING_RAW" \
+            --output-dir "$OUTPUT_DIR" \
+            --data-dir "$DATA_DIR"
+
+      - name: Run scraper (current year only)
+        if: env.MODE == 'current-year-only'
+        run: |
+          python scripts/00_scrape_noaa.py \
+            --current-year-only \
+            --output-dir "$OUTPUT_DIR" \
+            --data-dir "$DATA_DIR"
+
+      - name: Run scraper (full rebuild)
+        if: env.MODE == 'full-rebuild'
+        run: |
+          end_year="${{ github.event.inputs.end_year }}"
+          end_arg=""
+          if [ -n "$end_year" ]; then end_arg="--end-year $end_year"; fi
+          python scripts/00_scrape_noaa.py \
+            --start-year "${{ github.event.inputs.start_year }}" \
+            $end_arg \
+            --output-dir "$OUTPUT_DIR" \
+            --data-dir "$DATA_DIR"
+
+      - name: List outputs
+        run: ls -lah "$OUTPUT_DIR"
+
+      - name: Upload outputs to S3
+        run: |
+          python scripts/01_upload_to_s3.py \
+            --bucket "$S3_BUCKET" \
+            --prefix "$S3_PREFIX" \
+            --output-dir "$OUTPUT_DIR"
+
+      - name: Upload outputs to OSF
+        # Only runs when OSF_TOKEN and OSF_PROJECT secrets are set. Failures
+        # here do NOT fail the workflow — OSF is the secondary destination.
+        if: env.OSF_TOKEN != '' && env.OSF_PROJECT != ''
+        continue-on-error: true
+        run: |
+          python scripts/03_publish_to_osf.py \
+            --project "$OSF_PROJECT" \
+            --remote-path noaa-storm-events \
+            --output-dir "$OUTPUT_DIR"
+
+      - name: Build sample data for public repo
+        run: |
+          python scripts/02_build_sample.py \
+            --output-dir "$OUTPUT_DIR" \
+            --sample-dir data_sample
+
+      - name: Commit refreshed sample data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data_sample/
+          if git diff --cached --quiet; then
+            echo "No sample changes to commit."
+          else
+            git commit -m "Refresh data_sample/ from run #${{ github.run_number }} (mode: $MODE)"
+            git push
+          fi
+
+      - name: Upload outputs as workflow artifacts (90 day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: noaa-storm-events-${{ github.run_number }}
+          path: outputs/*.csv
+          retention-days: 90
